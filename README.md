@@ -33,7 +33,12 @@ Coming soon.
 
 ### Can I remove packages?
 
-No. (coming soon as well).
+Yes! You need to specify the version.
+```
+apts3 remove --bucket the-s3-bucket package-name package-version
+```
+
+Tip: you can use `apts3 list` to get a list of all packages in the repository.
 
 ### How do I make the repo public?
 

@@ -13,6 +13,7 @@ import boto3
 
 DEFAULT_COMPONENT = 'main'
 DEFAULT_RELEASE = 'stable'
+DEFAULT_ARCHITECTURE = 'all'
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +206,12 @@ class Manifest:
         self.topush.append((deb.filename, pool_filename))
         self.dirty = True
 
+    def remove_package(self, package, version):
+        del self.packages[f'{package}_{version}']
+        logger.debug(f' removing {package}:{version}')
+        # FIXME: the actual .deb file remains in the pool
+        self.dirty = True
+
     def flatten(self):
         lines = []
         for deb in self.packages.values():
@@ -298,6 +305,12 @@ class Release:
     def components(self):
         return set(x.component for x in self.manifests.values())
 
+    def get_manifest(self, component, architecture):
+        key = f'{component}/binary-{architecture}/Packages'
+        if key not in self.manifests or isinstance(self.manifests[key], UnloadedManifest):
+            self.manifests[key] = Manifest(self.s3, self.codename, component, architecture)
+        return self.manifests[key]
+
     def add_package(self, deb, component=DEFAULT_COMPONENT):
         arch = deb['Architecture']
         if arch == 'all':
@@ -306,16 +319,33 @@ class Release:
             archs = [arch]
 
         for arch in archs:
-            key = f'{component}/binary-{arch}/Packages'
-            if key not in self.manifests or isinstance(self.manifests[key],
-                    UnloadedManifest):
-                self.manifests[key] = Manifest(self.s3, self.codename,
-                        component, arch)
-            self.manifests[key].add_package(deb)
+            self.get_manifest(component, arch).add_package(deb)
+
+    def remove_package(self, package, version, arch=DEFAULT_ARCHITECTURE, component=DEFAULT_COMPONENT):
+        if arch == 'all':
+            archs = list(self.architectures)
+        else:
+            archs = [arch]
+
+        for arch in archs:
+            self.get_manifest(component, arch).remove_package(package, version)
+
+    def list_packages(self, arch=DEFAULT_ARCHITECTURE, component=DEFAULT_COMPONENT):
+        if arch == 'all':
+            archs = list(self.architectures)
+        else:
+            archs = [arch]
+
+        packages = []
+
+        for arch in archs:
+            for package in self.get_manifest(component, arch).packages.values():
+                packages.append((arch, component, package))
+        return packages
 
     def flush(self):
         dirty = False
-        for _, man in self.manifests.items():
+        for man in self.manifests.values():
             if man.flush():
                 dirty = True
 
@@ -327,7 +357,7 @@ class Release:
         pass
 
 
-def upload(debfile, bucket, prefix=None, sign_key=None, codename=None, component=None):
+def upload(debfile, bucket, prefix=None, codename=None, component=None):
     prefix = prefix or ''
     codename = codename or DEFAULT_RELEASE
     component = component or DEFAULT_COMPONENT
@@ -337,8 +367,31 @@ def upload(debfile, bucket, prefix=None, sign_key=None, codename=None, component
     relfile = Release(s3proxy, codename)
     relfile.add_package(control, component=component)
     relfile.flush()
-    if sign_key is not None:
-        relfile.sign(sign_key)
+
+
+def remove(package, version, bucket, prefix=None, codename=None, component=None, architecture=None):
+    prefix = prefix or ''
+    codename = codename or DEFAULT_RELEASE
+    component = component or DEFAULT_COMPONENT
+    architecture = architecture or DEFAULT_ARCHITECTURE
+
+    s3proxy = S3Proxy(bucket, prefix)
+    relfile = Release(s3proxy, codename)
+    relfile.remove_package(package, version, architecture, component=component)
+    relfile.flush()
+
+
+def list_packages(bucket, prefix=None, codename=None, component=None, architecture=None):
+    prefix = prefix or ''
+    codename = codename or DEFAULT_RELEASE
+    component = component or DEFAULT_COMPONENT
+    architecture = architecture or DEFAULT_ARCHITECTURE
+
+    s3proxy = S3Proxy(bucket, prefix)
+    relfile = Release(s3proxy, codename)
+
+    for _, _, package in relfile.list_packages(arch=architecture, component=component):
+        print(f'  {package["Package"]:>32} {package["Version"]:<16} {package["Architecture"]}')
 
 
 def parse_args():
@@ -346,18 +399,39 @@ def parse_args():
     main_parser.add_argument('--verbose', '-v', action='store_true',
             help='more output')
     command_parsers = main_parser.add_subparsers(help='actions', required=True)
-    upload_subparser = command_parsers.add_parser('upload',
+
+    parent_parser = argparse.ArgumentParser(add_help=False)
+    parent_parser.add_argument('--bucket', '-b', required=True, help='S3 bucket')
+    parent_parser.add_argument('--prefix', '-p', help='s3 prefix path')
+
+    list_subparser = command_parsers.add_parser('list', parents=[parent_parser],
+            help='list packages in the APT repo')
+    list_subparser.set_defaults(func=list_packages)
+    list_subparser.add_argument('--codename', '-c',
+            help='APT codename (e.g. stable)')
+    list_subparser.add_argument('--component', '-m',
+            help='APT component (e.g. main)')
+    list_subparser.add_argument('--architecture', '-a',
+            help='APT architecture (e.g. arm64)')
+
+    upload_subparser = command_parsers.add_parser('upload', parents=[parent_parser],
             help='upload a .deb to the S3-backed APT repo')
     upload_subparser.set_defaults(func=upload)
-    upload_subparser.add_argument('--bucket', '-b', required=True,
-            help='S3 bucket')
-    upload_subparser.add_argument('--prefix', '-p',
-            help='s3 prefix path')
     upload_subparser.add_argument('--codename', '-c',
             help='APT codename (e.g. stable)')
     upload_subparser.add_argument('--component', '-m',
             help='APT component (e.g. main)')
     upload_subparser.add_argument('debfile')
+
+    remove_subparser = command_parsers.add_parser('remove', parents=[parent_parser],
+            help='remove a package from the S3-backed APT repo')
+    remove_subparser.set_defaults(func=remove)
+    remove_subparser.add_argument('--codename', '-c',
+            help='APT codename (e.g. stable)')
+    remove_subparser.add_argument('--component', '-m',
+            help='APT component (e.g. main)')
+    remove_subparser.add_argument('package')
+    remove_subparser.add_argument('version')
 
     return main_parser.parse_args()
 
